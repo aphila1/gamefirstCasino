@@ -292,11 +292,6 @@ const [activeRoomCode, setActiveRoomCode] = useState<string>(roomCode || "");
   const tableCards: Card[] = roomData?.table_cards || [];
   const playerHand: Card[] = localPlayer?.hand || [];
 
-
-  //const [aiOpponents, setAiOpponents] = useState<AIPlayer[]>([]);
-  //const [tableCards, setTableCards] = useState<Card[]>([]);
-  
-
   // Game Setup Configurations
   const [opponentCount, setOpponentCount] = useState<1 | 2>(1); // 1 = Two-Player, 2 = Three-Player Match
   const [activeTurn, setActiveTurn] = useState<TurnEntity | null>(null);
