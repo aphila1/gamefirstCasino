@@ -281,6 +281,8 @@ export default function App() {
 
         {currentScreen === "casino" && (
           <CasinoGame
+          currentUserId={profile?.id || null}
+    currentUsername={profile?.username || "Guest Player"}
             onExit={() => setCurrentScreen("hub")}
             onTriggerRules={() => setInfoGameKey("casino")}
           />

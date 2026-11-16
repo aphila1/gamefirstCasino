@@ -1,4 +1,8 @@
 import { useState, useEffect, useMemo } from "react";
+import { supabase } from "../../supabaseClient"; // Make sure your client is imported
+//import { Card, SuitType } from "./CasinoTypes"; // Keep your clean Type structs!
+
+
 
 // ==========================================
 // 1. TYPES & DATA STRUCTS
@@ -6,9 +10,18 @@ import { useState, useEffect, useMemo } from "react";
 export type SuitType = "♠" | "♥" | "♦" | "♣";
 export type TurnEntity = "player" | "ai1" | "ai2";
 
+/*interface MMOCasinoGameProps {
+  roomCode: string;   // Passed down from your lobby manager
+  currentUserId: string; // The logged-in human user ID
+}*/
+
+//i wonder if i should delete this
 interface CasinoGameProps {
-  onExit: () => void;
-  onTriggerRules: () => void;
+  roomCode?: string;
+  currentUserId: string|null;
+  currentUsername?: string;
+  onExit?: () => void;
+  onTriggerRules?: () => void;
 }
 
 export interface Card {
@@ -57,7 +70,7 @@ function useSelectionState<T>() {
   return { selectedItems, toggleSelection, clearSelection, setSelectedItems };
 }
 
-// Initialize the 40-card South African "Khasino" stripped pack (Aces to 10s only)
+ // Initialize the 40-card South African "Khasino" stripped pack (Aces to 10s only)
 const initializeStrippedDeck = (): Card[] => {
   const suits: SuitType[] = ["♠", "♥", "♦", "♣"];
   const deckInstance: Card[] = [];
@@ -88,17 +101,201 @@ const shuffleDeck = (targetDeck: Card[]): Card[] => {
   return cloned;
 };
 export default function CasinoGame({
-  onExit,
-  onTriggerRules,
+  roomCode, currentUserId,currentUsername, onExit, onTriggerRules
 }: CasinoGameProps) {
   // ==========================================
   // 2. STATE DECLARATIONS
   // ==========================================
+
+  // --- Live Synchronized Database States ---
+  const [roomId, setRoomId] = useState<string | null>(null);
+  const [roomData, setRoomData] = useState<any>(null);
+  const [allPlayers, setAllPlayers] = useState<any[]>([]);
+  const [myPlayerRowId, setMyPlayerRowId] = useState<string | null>(null);
+
   const [deck, setDeck] = useState<Card[]>([]);
-  const [playerHand, setPlayerHand] = useState<Card[]>([]);
-  const [aiOpponents, setAiOpponents] = useState<AIPlayer[]>([]);
-  const [tableCards, setTableCards] = useState<Card[]>([]);
-  const [playerCapturePile, setPlayerCapturePile] = useState<Card[]>([]);
+  
+  // 1. Fetch Room Data and Listen to Live Changes
+  
+const [activeRoomCode, setActiveRoomCode] = useState<string>(roomCode || "");
+  const [joinInput, setJoinInput] = useState<string>("");
+
+  // Create a brand new room in Supabase and sit in Seat 0
+  const handleCreateRoom = async () => {
+    const newCode = Math.random().toString(36).substring(2, 7).toUpperCase();
+
+    const { data: newRoom, error } = await supabase
+      .from("kasi_rooms")
+      .insert([{ room_code: newCode, turn_index: 0, table_cards: [], status: "waiting" }])
+      .select()
+      .single();
+
+    if (error || !newRoom) {
+      alert("Could not create room: " + error?.message);
+      return;
+    }
+
+    const { data: insertedPlayer, error: playerError } = await supabase.from("kasi_players").insert([
+    {
+      room_id: newRoom.id,
+      profile_id: currentUserId,
+      username: currentUsername || "Host",
+      seat_index: 0,
+      hand: [],
+      capture_pile: [],
+      sweeps:0, },
+  ])
+  .select()
+  .single();
+
+  if (playerError) {
+    alert("Player Insert Failed: " + playerError.message);
+    return;
+  }
+  if (insertedPlayer) {
+    setMyPlayerRowId(insertedPlayer.id);
+  }
+
+    setActiveRoomCode(newCode);
+  };
+
+  // Join an existing room by code and take the next open seat
+  const handleJoinRoom = async () => {
+    const codeToJoin = joinInput.trim().toUpperCase();
+    if (!codeToJoin) return;
+
+    const { data: existingRoom } = await supabase
+      .from("kasi_rooms")
+      .select("*, kasi_players(*)")
+      .eq("room_code", codeToJoin)
+      .maybeSingle();
+
+    if (!existingRoom) {
+      alert("Room not found! Check the code.");
+      return;
+    }
+
+    const currentPlayers = existingRoom.kasi_players || [];
+
+    // 1. Check if this logged-in user is ALREADY seated in this room (e.g., after a page refresh)
+    if (currentUserId) {
+      const alreadySeated = currentPlayers.find((p: any) => p.profile_id === currentUserId);
+      if (alreadySeated) {
+        setMyPlayerRowId(alreadySeated.id);
+        setActiveRoomCode(codeToJoin);
+        return;
+      }
+    }
+
+    // 2. Stop new players from joining if the table already has 4 people
+    if (currentPlayers.length >= 4) {
+      alert("This table is full (Max 4 players)!");
+      return;
+    }
+
+    // 3. Otherwise, insert into the next open seat
+    const nextSeat = currentPlayers.length;
+    const { data: insertedPlayer, error: playerError } = await supabase
+      .from("kasi_players")
+      .insert([
+        {
+          room_id: existingRoom.id,
+          profile_id: currentUserId,
+          username: currentUsername || `Player ${nextSeat + 1}`,
+          seat_index: nextSeat,
+          hand: [],
+          capture_pile: [],
+          sweeps: 0,
+        },
+      ])
+      .select()
+      .single();
+
+    if (playerError) {
+      alert("Player Insert Failed: " + playerError.message);
+      return;
+    }
+
+    if (insertedPlayer) {
+      setMyPlayerRowId(insertedPlayer.id);
+    }
+    setActiveRoomCode(codeToJoin);
+  };
+
+  // 1. Fetch Room Data and Listen to Live Changes
+  useEffect(() => {
+    if (!activeRoomCode || activeRoomCode === "undefined") return;
+
+    const initializeMultiplayer = async () => {
+      const { data: room } = await supabase
+        .from("kasi_rooms")
+        .select("*, kasi_players(*)")
+        .eq("room_code", activeRoomCode)
+        .maybeSingle();
+
+      if (room) {
+        setRoomId(room.id);
+        setRoomData(room);
+        setAllPlayers(room.kasi_players || []);
+
+        const roomSubscription = supabase
+          .channel(`room-${activeRoomCode}`)
+          .on(
+            "postgres_changes",
+            { event: "*", schema: "public", table: "kasi_rooms", filter: `id=eq.${room.id}` },
+            async () => {
+              const { data: updatedRoom } = await supabase
+                .from("kasi_rooms")
+                .select("*, kasi_players(*)")
+                .eq("id", room.id)
+                .single();
+              if (updatedRoom) {
+                setRoomData(updatedRoom);
+                setAllPlayers(updatedRoom.kasi_players || []);
+              }
+            }
+          )
+          .on(
+            "postgres_changes",
+            { event: "*", schema: "public", table: "kasi_players", filter: `room_id=eq.${room.id}` },
+            async () => {
+              const { data: updatedRoom } = await supabase
+                .from("kasi_rooms")
+                .select("*, kasi_players(*)")
+                .eq("id", room.id)
+                .single();
+              if (updatedRoom) {
+                setRoomData(updatedRoom);
+                setAllPlayers(updatedRoom.kasi_players || []);
+              }
+            }
+          )
+          .subscribe();
+
+        return () => {
+          supabase.removeChannel(roomSubscription);
+        };
+      }
+    };
+
+    initializeMultiplayer();
+  }, [activeRoomCode]);
+
+
+// 2. Identify who "You" are at this table
+  const localPlayer = allPlayers.find(
+    (p) => (myPlayerRowId && p.id === myPlayerRowId) || (currentUserId && p.profile_id === currentUserId)
+  );
+  const isMyTurn = roomData && localPlayer && roomData.turn_index === localPlayer.seat_index;
+
+  // Use variables extracted cleanly from the live database structures
+  const tableCards: Card[] = roomData?.table_cards || [];
+  const playerHand: Card[] = localPlayer?.hand || [];
+
+
+  //const [aiOpponents, setAiOpponents] = useState<AIPlayer[]>([]);
+  //const [tableCards, setTableCards] = useState<Card[]>([]);
+  
 
   // Game Setup Configurations
   const [opponentCount, setOpponentCount] = useState<1 | 2>(1); // 1 = Two-Player, 2 = Three-Player Match
@@ -106,7 +303,7 @@ export default function CasinoGame({
   const [currentRound, setCurrentRound] = useState<number>(1);
   const [totalRounds, setTotalRounds] = useState<number>(2);
   const [gameLog, setGameLog] = useState<string>(
-    "🇿🇦 Welcome to eKasi Casino! Pick your match mode below to shuffle.",
+    "",
   );
 
   // Interaction Workspaces
@@ -143,10 +340,9 @@ export default function CasinoGame({
   // Derived Match Status Evaluators
   const isPlayerHandEmpty = playerHand.length === 0;
   const isHandEmptyCycleReached = useMemo(() => {
-    const humanEmpty = playerHand.length === 0;
-    const aiEmpty = aiOpponents.every((ai) => ai.hand.length === 0);
-    return humanEmpty && aiEmpty;
-  }, [playerHand, aiOpponents]);
+  if (allPlayers.length === 0) return false;
+  return allPlayers.every((player) => (player.hand?.length || 0) === 0);
+}, [allPlayers]);
 
   // ==========================================
   // 3. ENGINE UTILITIES
@@ -181,408 +377,276 @@ export default function CasinoGame({
   // ==========================================
   // 4. GAME SYSTEM DEAL CONTROLLERS
   // ==========================================
-  const handleDealGame = (selectedPlayersCount: 1 | 2) => {
-    setOpponentCount(selectedPlayersCount);
-    let freshDeck = shuffleDeck(initializeStrippedDeck());
+  
+  const handleDealGame = async () => {
+    if (!roomId || allPlayers.length < 2 || allPlayers.length > 4) {
+      alert("You need between 2 and 4 players connected to start!");
+      return;
+    }
 
-    // Reset core metrics
-    setPlayerCapturePile([]);
-    setCurrentRound(1);
+    const freshDeck = shuffleDeck(initializeStrippedDeck());
+    const sortedPlayers = [...allPlayers].sort((a, b) => a.seat_index - b.seat_index);
+    const count = sortedPlayers.length;
+
+    // 2 Players = 10 cards each (Round 1 of 2)
+    // 3 Players = 13 cards each (1 card to floor)
+    // 4 Players = 10 cards each (All 40 dealt at once)
+    const cardsPerPlayer = count === 3 ? 13 : 10;
+    let cardCursor = 0;
+
+    for (const p of sortedPlayers) {
+      const dealtHand = freshDeck.slice(cardCursor, cardCursor + cardsPerPlayer);
+      cardCursor += cardsPerPlayer;
+
+      await supabase
+        .from("kasi_players")
+        .update({ hand: dealtHand, capture_pile: [], sweeps: 0 })
+        .eq("id", p.id);
+    }
+
+    const floorCards = count === 3 ? freshDeck.slice(39, 40) : [];
+    const leftoverDeck = count === 2 ? freshDeck.slice(20) : [];
+    const randomStarterSeat = Math.floor(Math.random() * count);
+
+    await supabase
+      .from("kasi_rooms")
+      .update({
+        table_cards: floorCards,
+        deck: leftoverDeck,
+        turn_index: randomStarterSeat,
+        status: "playing",
+        last_capturer_seat: null,
+        game_log: `🎴 ${count}-Player Match Started! ${sortedPlayers[randomStarterSeat].username} goes first.`,
+      })
+      .eq("id", roomId);
+
     setSelectedHandCard(null);
     clearTableSelection();
-    setSweepsCount({ player: 0, ai1: 0, ai2: 0 });
-    setLastCapturer(null);
-
-    if (selectedPlayersCount === 1) {
-      // 2 Players: 10 cards each per round (2 Rounds total = 40 cards)
-      setTotalRounds(2);
-      setPlayerHand(freshDeck.slice(0, 10));
-
-      const generatedAI: AIPlayer[] = [
-        {
-          id: 1,
-          name: "🤖 AI Opponent",
-          hand: freshDeck.slice(10, 20),
-          capturePile: [],
-        },
-      ];
-      setAiOpponents(generatedAI);
-      setTableCards([]); // Base game setup starts with an empty floor structure
-      setDeck(freshDeck.slice(20)); // Remaining 20 cards reserved for round 2
-
-      const turnSelector: TurnEntity = Math.random() < 0.5 ? "player" : "ai1";
-      setActiveTurn(turnSelector);
-      setGameLog(
-        `🎴 2-Player Match Initiated. 10 cards dealt to each player. Round 1 of 2.`,
-      );
-    } else {
-      // 3 Players: 13 cards each (39 cards total), remaining 1 card drops to the floor
-      setTotalRounds(1);
-      setPlayerHand(freshDeck.slice(0, 13));
-
-      const generatedAI: AIPlayer[] = [
-        {
-          id: 1,
-          name: "🤖 AI Opponent #1",
-          hand: freshDeck.slice(13, 26),
-          capturePile: [],
-        },
-        {
-          id: 2,
-          name: "🤖 AI Opponent #2",
-          hand: freshDeck.slice(26, 39),
-          capturePile: [],
-        },
-      ];
-      setAiOpponents(generatedAI);
-      setTableCards(freshDeck.slice(39, 40)); // 1 leftover card dropped to table floor
-      setDeck([]); // Deck is entirely emptied
-
-      const choices: TurnEntity[] = ["player", "ai1", "ai2"];
-      const randomStarter = choices[Math.floor(Math.random() * 3)];
-      setActiveTurn(randomStarter);
-      setGameLog(
-        `🎴 3-Player Match Initiated. 13 cards dealt to each player, 1 card left on floor.`,
-      );
-    }
   };
 
-  const handleDealNextRound = () => {
-    if (deck.length === 0) return;
+  const handleDealNextRound = async () => {
+    const remainingDeck: Card[] = roomData?.deck || [];
+    if (!roomId || remainingDeck.length < 20) return;
 
-    // Hand out the final 20 cards (10 to player, 10 to AI)
-    const nextPlayerHand = deck.slice(0, 10);
-    const nextAiHand = deck.slice(10, 20);
+    const sortedPlayers = [...allPlayers].sort((a, b) => a.seat_index - b.seat_index);
 
-    setPlayerHand(nextPlayerHand);
-    setAiOpponents((prev) =>
-      prev.map((ai) => (ai.id === 1 ? { ...ai, hand: nextAiHand } : ai)),
-    );
-    setDeck([]);
-    setCurrentRound(2);
+    for (let i = 0; i < sortedPlayers.length; i++) {
+      const nextHand = remainingDeck.slice(i * 10, (i + 1) * 10);
+      await supabase
+        .from("kasi_players")
+        .update({ hand: nextHand })
+        .eq("id", sortedPlayers[i].id);
+    }
 
-    // Reset round states
+    await supabase
+      .from("kasi_rooms")
+      .update({
+        deck: [],
+        turn_index: 0,
+        status: "playing",
+        game_log: "🔄 Round 2 Dealt! Final 10 cards distributed to both players.",
+      })
+      .eq("id", roomId);
+
     setSelectedHandCard(null);
     clearTableSelection();
-
-    setActiveTurn("player");
-    setGameLog(`🔄 Round 2 Dealt! Final 10 cards distributed to both players.`);
-  };
-
-  // Tracks who made the last successful capture ('player', 'ai1', or 'ai2')
-  const [lastCapturer, setLastCapturer] = useState<TurnEntity | null>(null);
-
-  // Helper utility for recursive math combination checking
-  const findAllSimultaneousCombinations = (
-    targetValue: number,
-    pool: Card[],
-  ): Card[] => {
-    let unallocatedPool = [...pool];
-    let totalCapturedCards: Card[] = [];
-
-    // Continuous deep-search loop
-    while (unallocatedPool.length > 0) {
-      const searchForSingleGroup = (
-        index: number,
-        currentSum: number,
-        currentGroup: Card[],
-      ): Card[] | null => {
-        if (currentSum === targetValue && currentGroup.length > 0)
-          return currentGroup;
-        if (currentSum > targetValue || index >= unallocatedPool.length)
-          return null;
-
-        // Route A: Include card
-        const withItem = searchForSingleGroup(
-          index + 1,
-          currentSum + unallocatedPool[index].value,
-          [...currentGroup, unallocatedPool[index]],
-        );
-        if (withItem) return withItem;
-
-        // Route B: Skip card
-        return searchForSingleGroup(index + 1, currentSum, currentGroup);
-      };
-
-      const foundGroup = searchForSingleGroup(0, 0, []);
-      if (foundGroup && foundGroup.length > 0) {
-        // Log group, pull them out of the pool, and loop to look for more combos
-        totalCapturedCards = [...totalCapturedCards, ...foundGroup];
-        const groupIds = foundGroup.map((c) => c.id);
-        unallocatedPool = unallocatedPool.filter(
-          (c) => !groupIds.includes(c.id),
-        );
-      } else {
-        // No further independent combinations exist for this target value
-        break;
-      }
-    }
-
-    return totalCapturedCards;
-  };
-
-  //AI can steal from a home pile
-  const findAiCrossTheftBuild = (
-    aiHand: Card[],
-    floor: Card[],
-    allAis: AIPlayer[],
-    currentAiId: number,
-  ) => {
-    // 1. Gather all valid opponent piles to target
-    const targets: { owner: "player" | number; topCard: Card }[] = [];
-    if (playerCapturePile.length > 0) {
-      targets.push({
-        owner: "player",
-        topCard: playerCapturePile[playerCapturePile.length - 1],
-      });
-    }
-    allAis.forEach((ai) => {
-      if (ai.id !== currentAiId && ai.capturePile.length > 0) {
-        targets.push({
-          owner: ai.id,
-          topCard: ai.capturePile[ai.capturePile.length - 1],
-        });
-      }
-    });
-
-    // 2. Scan for matching move combinations
-    for (const card of aiHand) {
-      // Ensure the AI holds a backup duplicate card in its hand to secure the build level
-      const holdsBackup = (targetVal: number) =>
-        aiHand.some((c) => c.id !== card.id && c.value === targetVal);
-
-      for (const t of targets) {
-        // Strategy A: Build ONTO their pile card (Hand Card + Floor Cards == Pile Card)
-        const partialFloorMatch = findAllSimultaneousCombinations(
-          t.topCard.value - card.value,
-          floor,
-        );
-        if (partialFloorMatch.length > 0 && holdsBackup(t.topCard.value)) {
-          return {
-            type: "onto" as const,
-            handCard: card,
-            floorCards: partialFloorMatch,
-            target: t.owner,
-            pileCard: t.topCard,
-          };
-        }
-
-        // Strategy B: Build USING their pile card (Hand Card + Pile Card == Single Floor Card)
-        for (const fCard of floor) {
-          if (
-            card.value + t.topCard.value === fCard.value &&
-            holdsBackup(fCard.value)
-          ) {
-            return {
-              type: "using" as const,
-              handCard: card,
-              floorCards: [fCard],
-              target: t.owner,
-              pileCard: t.topCard,
-            };
-          }
-        }
-      }
-    }
-    return null;
   };
 
   // ==========================================
   // 5. HUMAN PLAYER MOVE CONTROLLERS
   // ==========================================
 
-  // Action A: Trail a card face up onto the table floor
-  const handleTrailCard = (card: Card) => {
-    if (activeTurn !== "player") return;
+  //update your hand/pile, update the table floor, 
+  // and pass the turn to the next seat.
 
-    setTableCards((prev) => [...prev, card]);
-    setPlayerHand((prev) => prev.filter((c) => c.id !== card.id));
-    setSelectedHandCard(null);
-    clearTableSelection();
+  const syncMoveToDatabase = async (
+  newTableCards: Card[],
+  newPlayerHand: Card[],
+  newCapturePile: Card[],
+  newLogMessage: string,
+  madeCapture: boolean = false,
+  earnedSweep: boolean = false
+) => {
+  if (!roomData || !localPlayer || !roomId) return;
 
-    setGameLog(
-      `💨 You trailed a ${card.label}${card.suit} onto the table floor.`,
-    );
-    advanceTurnSystem();
+  const nextTurnIndex = (roomData.turn_index + 1) % allPlayers.length;
+  const currentSweeps = localPlayer.sweeps || 0;
+
+  // 1. Update your player row (hand, pile, and sweeps)
+  await supabase
+    .from("kasi_players")
+    .update({
+      hand: newPlayerHand,
+      capture_pile: newCapturePile,
+      sweeps: earnedSweep ? currentSweeps + 1 : currentSweeps,
+    })
+    .eq("id", localPlayer.id);
+
+  // 2. Update the room row (table cards, turn index, game log, last capturer)
+  const roomUpdates: any = {
+    table_cards: newTableCards,
+    turn_index: nextTurnIndex,
+    game_log: newLogMessage,
   };
+
+  if (madeCapture) {
+    roomUpdates.last_capturer_seat = localPlayer.seat_index;
+  }
+
+  await supabase
+    .from("kasi_rooms")
+    .update(roomUpdates)
+    .eq("id", roomId);
+
+  // 3. Clear your local click selections
+  setSelectedHandCard(null);
+  clearTableSelection();
+};
+
+  // Action A: Trail a card face up onto the table floor
+  const handleTrailCard = async (card: Card) => {
+  if (!isMyTurn || !localPlayer) return;
+
+  const updatedTable = [...tableCards, card];
+  const updatedHand = playerHand.filter((c) => c.id !== card.id);
+  const log = `💨 ${localPlayer.username || "Player"} trailed a ${card.label}${card.suit}.`;
+
+  await syncMoveToDatabase(updatedTable, updatedHand, localPlayer.capture_pile || [], log, false, false);
+};
 
   // Action B: Capture a single identical matching card from the floor
-  const handleSingleMatch = (handCard: Card, floorCard: Card) => {
-    if (activeTurn !== "player") return;
-    if (handCard.value !== floorCard.value) return;
+  const handleSingleMatch = async (handCard: Card, floorCard: Card) => {
+  if (!isMyTurn || !localPlayer) return;
+  if (handCard.value !== floorCard.value) return;
 
-    const capturedBatch = [handCard, floorCard];
-    setTableCards((prev) => prev.filter((c) => c.id !== floorCard.id));
-    setPlayerHand((prev) => prev.filter((c) => c.id !== handCard.id));
-    setPlayerCapturePile((prev) => [...prev, ...capturedBatch]);
+  const updatedTable = tableCards.filter((c) => c.id !== floorCard.id);
+  const updatedHand = playerHand.filter((c) => c.id !== handCard.id);
+  const updatedPile = [...(localPlayer.capture_pile || []), handCard, floorCard];
 
-    // Log player as the last successful capturer
-    setLastCapturer("player");
+  // Check for Sweep (cleared the table, and it's not the very last card of the match)
+  const isSweep = updatedTable.length === 0;
+  const allOtherHandsEmpty = allPlayers.every((p) => p.id === localPlayer.id || (p.hand?.length || 0) === 0);
+  const isLastCard = updatedHand.length === 0 && allOtherHandsEmpty && (roomData.deck?.length || 0) === 0;
+  const earnedSweep = isSweep && !isLastCard;
 
-    // Check if this cleared the floor, and ENSURE it wasn't your last card
-    const isSweep = tableCards.length === 1;
-    const isLastCardOfGame =
-      playerHand.length === 1 &&
-      aiOpponents.every((ai) => ai.hand.length === 0) &&
-      (opponentCount === 1 ? currentRound === 2 : true);
+  const log = earnedSweep
+    ? `💥 SWEEP! ${localPlayer.username} matched ${handCard.label}${handCard.suit} for +1 point!`
+    : `🎯 ${localPlayer.username} matched ${handCard.label}${handCard.suit} with ${floorCard.label}${floorCard.suit}.`;
 
-    if (isSweep && !isLastCardOfGame) {
-      setSweepsCount((prev) => ({ ...prev, player: prev.player + 1 }));
-      setGameLog(
-        `💥 SWEEP! You matched a ${handCard.label}${handCard.suit} for +1 point!`,
-      );
-    } else {
-      setGameLog(
-        `🎯 You matched your ${handCard.label}${handCard.suit} with a ${floorCard.label}${floorCard.suit}.`,
-      );
-    }
-
-    setSelectedHandCard(null);
-    clearTableSelection();
-    advanceTurnSystem();
-  };
+  await syncMoveToDatabase(updatedTable, updatedHand, updatedPile, log, true, earnedSweep);
+};
 
   // Action C: Execute an aggressive Pile Theft from an opponent
-  const handleExecuteTheft = (handCard: Card, target: "player" | number) => {
-    if (activeTurn !== "player") return;
+  const handleExecuteTheft = async (handCard: Card, targetPlayerId: string) => {
+  if (!isMyTurn || !localPlayer) return;
 
-    let stolenBatch: Card[] = [];
-    let opponentName = "";
+  const targetPlayer = allPlayers.find((p) => p.id === targetPlayerId);
+  if (!targetPlayer || targetPlayer.capture_pile.length === 0) return;
 
-    if (target === "player") return; // Cannot steal from yourself
+  const topOpponentCard = targetPlayer.capture_pile[targetPlayer.capture_pile.length - 1];
 
-    // Access target AI and pull their pile
-    const targetAi = aiOpponents.find((ai) => ai.id === target);
-    if (!targetAi || targetAi.capturePile.length === 0) return;
+  if (handCard.value !== topOpponentCard.value) {
+    setGameLog("❌ Invalid Theft: Your card value doesn't match their top pile card.");
+    return;
+  }
 
-    const topOpponentCard =
-      targetAi.capturePile[targetAi.capturePile.length - 1];
-    if (handCard.value !== topOpponentCard.value) {
-      setGameLog(
-        `❌ Invalid Theft: Your ${handCard.label} does not match their top card (${topOpponentCard.label}).`,
-      );
-      return;
-    }
+  // 1. Compile the newly stolen stash
+  const stolenBatch = [...targetPlayer.capture_pile];
+  const updatedMyCapturePile = [...(localPlayer.capture_pile || []), handCard, ...stolenBatch];
+  const updatedMyHand = playerHand.filter((c) => c.id !== handCard.id);
 
-    // Extract pile and clear target
-    stolenBatch = [...targetAi.capturePile];
-    opponentName = targetAi.name;
+  // 2. Calculate the next turn order around the table
+  const nextTurnIndex = (roomData.turn_index + 1) % allPlayers.length;
 
-    setAiOpponents((prev) =>
-      prev.map((ai) => (ai.id === target ? { ...ai, capturePile: [] } : ai)),
-    );
+  // 3. Atomically update the database (or use an RPC function)
+  // Clear target's pile
+  await supabase
+    .from("kasi_players")
+    .update({ capture_pile: [] })
+    .eq("id", targetPlayerId);
 
-    // Combine player card with entire stolen pile
-    setPlayerCapturePile((prev) => [...prev, handCard, ...stolenBatch]);
-    setPlayerHand((prev) => prev.filter((c) => c.id !== handCard.id));
+  // Give everything to the local player
+  await supabase
+    .from("kasi_players")
+    .update({ hand: updatedMyHand, capture_pile: updatedMyCapturePile })
+    .eq("id", localPlayer.id);
 
-    setGameLog(
-      `⚔️ CASINO THEFT! You used a ${handCard.label}${handCard.suit} to steal ${opponentName}'s entire pile!`,
-    );
+  // Advance the room state turn index
+  await supabase
+    .from("kasi_rooms")
+    .update({ 
+      turn_index: nextTurnIndex,
+      last_capturer_seat: localPlayer.seat_index,
+      game_log: `⚔ MMO CASINO THEFT! ${localPlayer.username} stole ${targetPlayer.username}'s entire pile!`,
+    })
+    .eq("id", roomId);
 
-    setSelectedHandCard(null);
-    clearTableSelection();
-    setIsStealTargetHuman(false);
-    setStealTargetAiId(null);
-    advanceTurnSystem();
-  };
+  setGameLog(`⚔ MMO CASINO THEFT! You stole ${targetPlayer.username}'s entire pile!`);
+  setSelectedHandCard(null);
+};
   // Action D: Capture multiple table cards that add up to your played card value
-  const handleComboCapture = (handCard: Card, selectedFloor: Card[]) => {
-    if (activeTurn !== "player") return;
+  const handleComboCapture = async (handCard: Card, selectedFloor: Card[]) => {
+  if (!isMyTurn || !localPlayer) return;
 
-    const totalFloorSum = selectedFloor.reduce((sum, c) => sum + c.value, 0);
-    if (totalFloorSum % handCard.value !== 0 || totalFloorSum === 0) {
-      setGameLog(`❌ Invalid Combo Selection.`);
-      return;
-    }
+  const totalFloorSum = selectedFloor.reduce((sum, c) => sum + c.value, 0);
+  if (totalFloorSum % handCard.value !== 0 || totalFloorSum === 0) {
+    setGameLog(`❌ Invalid Combo Selection.`);
+    return;
+  }
 
-    const calculatedSubGroups = totalFloorSum / handCard.value;
-    const capturedBatch = [handCard, ...selectedFloor];
-    const floorIds = selectedFloor.map((c) => c.id);
+  const floorIds = selectedFloor.map((c) => c.id);
+  const updatedTable = tableCards.filter((c) => !floorIds.includes(c.id));
+  const updatedHand = playerHand.filter((c) => c.id !== handCard.id);
+  const updatedPile = [...(localPlayer.capture_pile || []), handCard, ...selectedFloor];
 
-    setTableCards((prev) => prev.filter((c) => !floorIds.includes(c.id)));
-    setPlayerHand((prev) => prev.filter((c) => c.id !== handCard.id));
-    setPlayerCapturePile((prev) => [...prev, ...capturedBatch]);
+  const isSweep = updatedTable.length === 0;
+  const allOtherHandsEmpty = allPlayers.every((p) => p.id === localPlayer.id || (p.hand?.length || 0) === 0);
+  const isLastCard = updatedHand.length === 0 && allOtherHandsEmpty && (roomData.deck?.length || 0) === 0;
+  const earnedSweep = isSweep && !isLastCard;
 
-    // Log player as the last successful capturer
-    setLastCapturer("player");
+  const log = earnedSweep
+    ? `💥 MULTI-SWEEP! ${localPlayer.username} cleared the floor for +1 point!`
+    : `🤖 ${localPlayer.username} scooped a combo using ${handCard.label}${handCard.suit}!`;
 
-    // Sweep validation
-    const isSweep = tableCards.length === selectedFloor.length;
-    const isLastCardOfGame =
-      playerHand.length === 1 &&
-      aiOpponents.every((ai) => ai.hand.length === 0) &&
-      (opponentCount === 1 ? currentRound === 2 : true);
-
-    if (isSweep && !isLastCardOfGame) {
-      setSweepsCount((prev) => ({ ...prev, player: prev.player + 1 }));
-      setGameLog(`💥 MULTI-SWEEP! Floor cleared for +1 point!`);
-    } else {
-      setGameLog(
-        `🧮 Multi-Fish Scooped! Caught ${calculatedSubGroups} separate combinations.`,
-      );
-    }
-
-    setSelectedHandCard(null);
-    clearTableSelection();
-    advanceTurnSystem();
-  };
+  await syncMoveToDatabase(updatedTable, updatedHand, updatedPile, log, true, earnedSweep);
+};
 
   // Action E: Build a numerical compound value on the table floor
-  const handleCreateBuild = (
-    handCard: Card,
-    selectedFloor: Card[],
-    buildValue: number,
-  ) => {
-    if (activeTurn !== "player") return;
+  const handleCreateBuild = async (handCard: Card, selectedFloor: Card[], buildValue: number) => {
+  if (!isMyTurn || !localPlayer) return;
 
-    const floorSum = selectedFloor.reduce((sum, c) => sum + c.value, 0);
-    if (handCard.value + floorSum !== buildValue) {
-      setGameLog(`❌ Invalid Build Value Configuration.`);
-      return;
-    }
+  const floorSum = selectedFloor.reduce((sum, c) => sum + c.value, 0);
+  if (handCard.value + floorSum !== buildValue) {
+    setGameLog(`❌ Invalid Build Value Configuration.`);
+    return;
+  }
 
-    const hasMatchingCardInHand = playerHand.some(
-      (c) => c.id !== handCard.id && c.value === buildValue,
-    );
-    if (!hasMatchingCardInHand) {
-      setGameLog(
-        `❌ Invalid Build: You must hold a ${buildValue} in hand to back up this build.`,
-      );
-      return;
-    }
+  const hasBackup = playerHand.some((c) => c.id !== handCard.id && c.value === buildValue);
+  if (!hasBackup) {
+    setGameLog(`❌ Invalid Build: You must hold a ${buildValue} in hand to back up this build.`);
+    return;
+  }
 
-    // Merge hand card and floor selections into a single tabletop compound element
-
-    const complexBuildItem: Card = {
-      id: `build-${Date.now()}`,
-      suit: handCard.suit,
-      value: buildValue,
-      label: `BUILD (${buildValue})`,
-    };
-
-    const floorIds = selectedFloor.map((c) => c.id);
-    setTableCards((prev) => [
-      ...prev.filter((c) => !floorIds.includes(c.id)),
-      complexBuildItem,
-    ]);
-    setPlayerHand((prev) => prev.filter((c) => c.id !== handCard.id));
-
-    setGameLog(
-      `🏗️ Build Set! Created a tactical level ${buildValue} compound on the floor.`,
-    );
-    setSelectedHandCard(null);
-    clearTableSelection();
-    //setActiveActionModal("none");
-    //setActiveBuildValue(null);
-    advanceTurnSystem();
+  const complexBuildItem: Card = {
+    id: `build-${Date.now()}`,
+    suit: handCard.suit,
+    value: buildValue,
+    label: `BUILD (${buildValue})`,
   };
+
+  const floorIds = selectedFloor.map((c) => c.id);
+  const updatedTable = [...tableCards.filter((c) => !floorIds.includes(c.id)), complexBuildItem];
+  const updatedHand = playerHand.filter((c) => c.id !== handCard.id);
+  const log = `🏗️ ${localPlayer.username} set a Level ${buildValue} Build on the floor!`;
+
+  await syncMoveToDatabase(updatedTable, updatedHand, localPlayer.capture_pile || [], log, false, false);
+};
   const handleAddToExistingBuild = (
     handCard: Card,
     selectedFloor: Card[],
     targetBuildToken: Card,
   ) => {
-    if (activeTurn !== "player") return;
+    if (!isMyTurn) return;
 
     // Calculate the mathematical value of the extra cards being added
     const extraFloorSum = selectedFloor.reduce((sum, c) => sum + c.value, 0);
@@ -624,18 +688,17 @@ export default function CasinoGame({
   };
   //stealing from your opponents building
   // Move 1: Play hand card + floor card(s) to BUILD ONTO an opponent's top pile card
-  const handleBuildOntoPile = (
+  const handleBuildOntoPile = async (
     handCard: Card,
     selectedFloor: Card[],
-    targetAiId: number,
+    targetPlayerId: string,
     targetPileCard: Card,
   ) => {
-    if (activeTurn !== "player") return;
+    if (!isMyTurn || !localPlayer || !roomId) return;
 
     const floorSum = selectedFloor.reduce((sum, c) => sum + c.value, 0);
     const compoundValue = handCard.value + floorSum;
 
-    // The combination must mathematically equal the opponent's top card to build onto it
     if (compoundValue !== targetPileCard.value) {
       setGameLog(
         `❌ Invalid: Hand + floor sum (${compoundValue}) must match pile card (${targetPileCard.value}).`,
@@ -643,7 +706,6 @@ export default function CasinoGame({
       return;
     }
 
-    // Verify player holds the ultimate capture card for this build level
     const hasBackup = playerHand.some(
       (c) => c.id !== handCard.id && c.value === compoundValue,
     );
@@ -654,11 +716,9 @@ export default function CasinoGame({
       return;
     }
 
-    const floorIds = selectedFloor.map((c) => c.id);
-    const targetAi = aiOpponents.find((a) => a.id === targetAiId);
-    if (!targetAi) return;
+    const targetPlayer = allPlayers.find((p) => p.id === targetPlayerId);
+    if (!targetPlayer) return;
 
-    // Create the build token
     const newBuildToken: Card = {
       id: `pile-build-${Date.now()}`,
       suit: handCard.suit,
@@ -666,42 +726,42 @@ export default function CasinoGame({
       label: `BUILD (${compoundValue})`,
     };
 
-    // Remove the top card from the AI's capture pile
-    setAiOpponents((prev) =>
-      prev.map((ai) => {
-        if (ai.id === targetAiId) {
-          return { ...ai, capturePile: ai.capturePile.slice(0, -1) };
-        }
-        return ai;
-      }),
-    );
-
-    // Place the floor cards, hand card, and the stolen top card into a compound build on the floor
-    setTableCards((prev) => [
-      ...prev.filter((c) => !floorIds.includes(c.id)),
+    const floorIds = selectedFloor.map((c) => c.id);
+    const updatedTable = [
+      ...tableCards.filter((c) => !floorIds.includes(c.id)),
       newBuildToken,
-    ]);
-    setPlayerHand((prev) => prev.filter((c) => c.id !== handCard.id));
+    ];
+    const updatedHand = playerHand.filter((c) => c.id !== handCard.id);
+    const updatedTargetPile = (targetPlayer.capture_pile || []).slice(0, -1);
+    const log = `🏗️ Pile Lockdown! ${localPlayer.username} built onto ${targetPlayer.username}'s ${targetPileCard.label}!`;
 
-    setGameLog(
-      `🏗️ Pile Lockdown! You combined your ${handCard.label} with the floor to build right ONTO ${targetAi.name}'s ${targetPileCard.label}!`,
+    // 1. Peel top card off opponent's pile in Supabase
+    await supabase
+      .from("kasi_players")
+      .update({ capture_pile: updatedTargetPile })
+      .eq("id", targetPlayerId);
+
+    // 2. Sync your hand, the new floor build, and advance turn
+    await syncMoveToDatabase(
+      updatedTable,
+      updatedHand,
+      localPlayer.capture_pile || [],
+      log,
+      false,
+      false,
     );
 
-    // Reset workspace
-    setSelectedHandCard(null);
-    clearTableSelection();
     setSelectedPileTarget(null);
-    advanceTurnSystem();
   };
 
   // Move 2: Play hand card + steal opponent's top card to BUILD USING it on a floor card
-  const handleBuildUsingPile = (
+  const handleBuildUsingPile = async (
     handCard: Card,
     selectedFloor: Card[],
-    targetAiId: number,
+    targetPlayerId: string,
     targetPileCard: Card,
   ) => {
-    if (activeTurn !== "player") return;
+    if (!isMyTurn || !localPlayer || !roomId) return;
 
     if (selectedFloor.length !== 1) {
       setGameLog(
@@ -713,7 +773,6 @@ export default function CasinoGame({
     const floorCard = selectedFloor[0];
     const compoundValue = handCard.value + targetPileCard.value;
 
-    // The hand card + stolen pile card must equal the targeted floor card value
     if (compoundValue !== floorCard.value) {
       setGameLog(
         `❌ Invalid: Hand + pile card (${compoundValue}) must equal the floor card (${floorCard.value}).`,
@@ -731,8 +790,8 @@ export default function CasinoGame({
       return;
     }
 
-    const targetAi = aiOpponents.find((a) => a.id === targetAiId);
-    if (!targetAi) return;
+    const targetPlayer = allPlayers.find((p) => p.id === targetPlayerId);
+    if (!targetPlayer) return;
 
     const newBuildToken: Card = {
       id: `use-build-${Date.now()}`,
@@ -741,126 +800,123 @@ export default function CasinoGame({
       label: `BUILD (${compoundValue})`,
     };
 
-    // Peel the top card off the opponent's pile
-    setAiOpponents((prev) =>
-      prev.map((ai) => {
-        if (ai.id === targetAiId) {
-          return { ...ai, capturePile: ai.capturePile.slice(0, -1) };
-        }
-        return ai;
-      }),
+    const updatedTable = tableCards.map((c) =>
+      c.id === floorCard.id ? newBuildToken : c,
+    );
+    const updatedHand = playerHand.filter((c) => c.id !== handCard.id);
+    const updatedTargetPile = (targetPlayer.capture_pile || []).slice(0, -1);
+    const log = `⚔ Hand Hijack! ${localPlayer.username} snatched ${targetPlayer.username}'s ${targetPileCard.label} to build ${floorCard.label}!`;
+
+    // 1. Peel top card off opponent's pile in Supabase
+    await supabase
+      .from("kasi_players")
+      .update({ capture_pile: updatedTargetPile })
+      .eq("id", targetPlayerId);
+
+    // 2. Sync your hand, the updated floor build, and advance turn
+    await syncMoveToDatabase(
+      updatedTable,
+      updatedHand,
+      localPlayer.capture_pile || [],
+      log,
+      false,
+      false,
     );
 
-    // Transform the targeted floor card into the compound build token
-    setTableCards((prev) =>
-      prev.map((c) => (c.id === floorCard.id ? newBuildToken : c)),
-    );
-    setPlayerHand((prev) => prev.filter((c) => c.id !== handCard.id));
-
-    setGameLog(
-      `⚔️ Hand Hijack! You snatched ${targetAi.name}'s ${targetPileCard.label}, matched it with your ${handCard.label}, and built onto the floor's ${floorCard.label}!`,
-    );
-
-    setSelectedHandCard(null);
-    clearTableSelection();
     setSelectedPileTarget(null);
-    advanceTurnSystem();
   };
 
-  // ==========================================
-  // 6. TRADITIONAL SCORING EVALUATOR CYCLE
+   // ==========================================
+  // 6. TRADITIONAL MMO SCORING EVALUATOR CYCLE
   // ==========================================
   useEffect(() => {
-    if (isHandEmptyCycleReached && activeTurn !== null) {
-      // If playing 2-player mode and it's only the end of Round 1, pause for the next deal
-      if (opponentCount === 1 && currentRound === 1) {
-        setGameLog(
-          "🎴 Hands empty! Round 1 complete. Click 'Deal Round 2' to hand out remaining cards.",
-        );
+    // Only run when all hands are empty, game is active, and YOU are the Host (Seat 0)
+    const isHost = localPlayer?.seat_index === 0;
+    const isGameActive = roomData?.status === "playing" || roomData?.turn_index !== null;
+    
+    if (!isHandEmptyCycleReached || !roomData || !isHost || !isGameActive) return;
+
+    const processEndOfCycle = async () => {
+      const remainingDeck: Card[] = roomData.deck || [];
+
+      // 1. If there are still cards in the deck (Round 1 of a 2-player game), pause for Round 2
+      if (remainingDeck.length > 0) {
+        await supabase
+          .from("kasi_rooms")
+          .update({
+            game_log: "🎴 Hands empty! Round 1 complete. Host: click 'Deal Round 2' to hand out remaining cards.",
+            status: "round_pause",
+          })
+          .eq("id", roomId);
         return;
       }
 
-      // EXECUTE THE LAST TRICK SCOOP RULES
-      let finalPlayerPile = [...playerCapturePile];
-      let updatedAiOpponents = [...aiOpponents];
+      // 2. Otherwise, the match is completely over! Scoop remaining floor cards to last capturer
       let bonusLogMessage = "";
-
-      if (tableCards.length > 0) {
-        if (lastCapturer === "player") {
-          finalPlayerPile = [...finalPlayerPile, ...tableCards];
-          bonusLogMessage = ` 🎁 Last Trick Bonus: You made the last capture, sweeping up the remaining ${tableCards.length} table cards!`;
-        } else if (lastCapturer === "ai1" || lastCapturer === "ai2") {
-          const winnerId = lastCapturer === "ai1" ? 1 : 2;
-          updatedAiOpponents = aiOpponents.map((ai) => {
-            if (ai.id === winnerId) {
-              return { ...ai, capturePile: [...ai.capturePile, ...tableCards] };
-            }
-            return ai;
-          });
-          const aiName = winnerId === 1 ? "AI Opponent #1" : "AI Opponent #2";
-          bonusLogMessage = ` 🎁 Last Trick Bonus: ${aiName} made the last capture, scooping up the remaining ${tableCards.length} table cards!`;
+      const updatedPlayers = allPlayers.map((p) => {
+        let pile: Card[] = [...(p.capture_pile || [])];
+        if (tableCards.length > 0 && p.seat_index === roomData.last_capturer_seat) {
+          pile = [...pile, ...tableCards];
+          bonusLogMessage = ` 🎁 Last Trick Bonus: ${p.username} swept up the remaining ${tableCards.length} table cards!`;
         }
-        // Force the table layout to empty since leftovers are harvested
-        setTableCards([]);
+        return { ...p, finalPile: pile };
+      });
+
+      // 3. Calculate base points, card counts, and spades for every player
+      const evaluated = updatedPlayers.map((p) => {
+        const metrics = evaluatePile(p.finalPile);
+        const sweeps = p.sweeps || 0;
+        return {
+          ...p,
+          metrics,
+          totalPoints: metrics.points + sweeps,
+        };
+      });
+
+      // 4. Award Majority Bonuses (+2 Most Cards, +1 Most Spades)
+      const maxCards = Math.max(...evaluated.map((p) => p.metrics.cards));
+      const maxSpades = Math.max(...evaluated.map((p) => p.metrics.spades));
+
+      evaluated.forEach((p) => {
+        if (p.metrics.cards === maxCards && maxCards > 0) p.totalPoints += 2;
+        if (p.metrics.spades === maxSpades && maxSpades > 0) p.totalPoints += 1;
+      });
+
+      // 5. Build the final scoreboard and crown the winner
+      const sortedByScore = [...evaluated].sort((a, b) => b.totalPoints - a.totalPoints);
+      const winner = sortedByScore[0];
+      const scoreboard = evaluated
+        .map((p) => `${p.username}: ${p.totalPoints} Pts (${p.metrics.cards} cards)`)
+        .join(" | ");
+
+      const finalAnnouncement = `🏆 Match Concluded! ${winner.username} WON!${bonusLogMessage} Final -> ${scoreboard}`;
+
+      // 6. Save updated piles and finish the room in Supabase
+      for (const p of evaluated) {
+        await supabase
+          .from("kasi_players")
+          .update({ capture_pile: p.finalPile })
+          .eq("id", p.id);
       }
 
-      // Parse traditional point metrics using our updated piles
-      const playerM = evaluatePile(finalPlayerPile);
-      const ai1M = evaluatePile(
-        updatedAiOpponents.find((a) => a.id === 1)?.capturePile || [],
-      );
-      const ai2M = evaluatePile(
-        updatedAiOpponents.find((a) => a.id === 2)?.capturePile || [],
-      );
+      await supabase
+        .from("kasi_rooms")
+        .update({
+          table_cards: [],
+          turn_index: null,
+          status: "finished",
+          game_log: finalAnnouncement,
+        })
+        .eq("id", roomId);
+    };
 
-      let playerFinal = playerM.points + sweepsCount.player;
-      let ai1Final = ai1M.points + sweepsCount.ai1;
-      let ai2Final = ai2M.points + sweepsCount.ai2;
-
-      // 1. Most Cards Majority Bonus (+2 Points)
-      const maxCards = Math.max(
-        playerM.cards,
-        ai1M.cards,
-        opponentCount === 2 ? ai2M.cards : 0,
-      );
-      if (playerM.cards === maxCards) playerFinal += 2;
-      if (ai1M.cards === maxCards) ai1Final += 2;
-      if (opponentCount === 2 && ai2M.cards === maxCards) ai2Final += 2;
-
-      // 2. Most Spades Majority Bonus (+1 Point)
-      const maxSpades = Math.max(
-        playerM.spades,
-        ai1M.spades,
-        opponentCount === 2 ? ai2M.spades : 0,
-      );
-      if (playerM.spades === maxSpades) playerFinal += 1;
-      if (ai1M.spades === maxSpades) ai1Final += 1;
-      if (opponentCount === 2 && ai2M.spades === maxSpades) ai2Final += 1;
-
-      let scoreboard = `You: ${playerFinal} Pts (${playerM.cards} cards, ${sweepsCount.player} sweeps) | AI1: ${ai1Final} Pts`;
-      if (opponentCount === 2) scoreboard += ` | AI2: ${ai2Final} Pts`;
-
-      let winnerAnnouncement = "🏆 Round Concluded!";
-      if (
-        playerFinal > ai1Final &&
-        (opponentCount === 1 || playerFinal > ai2Final)
-      ) {
-        winnerAnnouncement += " YOU WON THIS MATCH!";
-      } else {
-        winnerAnnouncement += " THE AI TOOK THIS ROUND.";
-      }
-
-      setGameLog(
-        `${winnerAnnouncement}${bonusLogMessage} Final Summary -> ${scoreboard}`,
-      );
-      setActiveTurn(null);
-    }
-  }, [isHandEmptyCycleReached, lastCapturer]);
+    processEndOfCycle();
+  }, [isHandEmptyCycleReached, roomData, allPlayers, localPlayer, tableCards, roomId]);
   // ==========================================
   // 7. OMNI-DIRECTIONAL AI AUTOMATION ENGINE
-  // ==========================================
+  /* ==========================================
   useEffect(() => {
-    if (!activeTurn || activeTurn === "player") return;
+    if (!activeTurn || isMyTurn) return;
 
     const currentAiId = activeTurn === "ai1" ? 1 : 2;
     const activeAi = aiOpponents.find((ai) => ai.id === currentAiId);
@@ -878,15 +934,15 @@ export default function CasinoGame({
       // ------ PHASE A: OMNIDIRECTIONAL PILE THEFT CHECK ------
 
       // 1. Check for outright single-card pile hijacking (Highest Priority)
-      if (playerCapturePile.length > 0) {
-        const topHumanCard = playerCapturePile[playerCapturePile.length - 1];
+      if ((localPlayer?.capture_pile || []).length > 0) {
+        const topHumanCard = (localPlayer?.capture_pile || [])[(localPlayer?.capture_pile || []).length - 1];
         const matchInHand = activeAi.hand.find(
           (c) => c.value === topHumanCard.value,
         );
         if (matchInHand) {
           chosenCard = matchInHand;
           stolenFromTarget = "player";
-          targetCapturedCards = [matchInHand, ...playerCapturePile];
+          targetCapturedCards = [matchInHand, ...(localPlayer?.capture_pile || [])];
         }
       }
 
@@ -912,7 +968,7 @@ export default function CasinoGame({
 
       // Execute Theft Action if matched
       if (stolenFromTarget !== null) {
-        if (stolenFromTarget === "player") setPlayerCapturePile([]);
+        if (stolenFromTarget === "player") set(localPlayer?.capture_pile || [])([]);
         else
           setAiOpponents((p) =>
             p.map((a) =>
@@ -956,7 +1012,7 @@ export default function CasinoGame({
           type === "onto" ? pileCard.value : floorCards[0].value;
 
         // Peel the top card off the targeted opponent's home capture pile
-        if (target === "player") setPlayerCapturePile((p) => p.slice(0, -1));
+        if (target === "player") set(localPlayer?.capture_pile || [])((p) => p.slice(0, -1));
         else
           setAiOpponents((p) =>
             p.map((a) =>
@@ -1090,10 +1146,84 @@ export default function CasinoGame({
     }, 1200);
 
     return () => clearTimeout(thinkingTimer);
-  }, [activeTurn, aiOpponents, tableCards, playerCapturePile, opponentCount]);
+  }, [activeTurn, aiOpponents, tableCards, (localPlayer?.capture_pile || []), opponentCount]);*/
   // ==========================================
   // 8. INTERACTIVE RENDER ENGINE (JSX)
   // ==========================================
+
+if (!activeRoomCode) {
+    return (
+      <div
+        style={{
+          maxWidth: "480px",
+          margin: "60px auto",
+          padding: "24px",
+          backgroundColor: "#1F2937",
+          color: "#F9FAFB",
+          borderRadius: "12px",
+          textAlign: "center",
+          fontFamily: "sans-serif",
+        }}
+      >
+        <h2 style={{ color: "#FBBF24", marginBottom: "8px" }}>
+          SA eKasi Casino Lobby
+        </h2>
+        <p style={{ color: "#9CA3AF", marginBottom: "24px", fontSize: "14px" }}>
+          Create a table and share the code with a friend (or open a second tab to test).
+        </p>
+
+        <button
+          onClick={handleCreateRoom}
+          style={{
+            width: "100%",
+            padding: "12px",
+            backgroundColor: "#059669",
+            color: "#FFF",
+            border: "none",
+            borderRadius: "8px",
+            fontWeight: "bold",
+            fontSize: "16px",
+            cursor: "pointer",
+            marginBottom: "20px",
+          }}
+        >
+          ➕ Create New Table
+        </button>
+
+        <div style={{ display: "flex", gap: "8px" }}>
+          <input
+            value={joinInput}
+            onChange={(e) => setJoinInput(e.target.value)}
+            placeholder="Enter 5-letter Room Code"
+            style={{
+              flex: 1,
+              padding: "10px",
+              borderRadius: "6px",
+              border: "1px solid #4B5563",
+              backgroundColor: "#111827",
+              color: "#FFF",
+              textTransform: "uppercase",
+            }}
+          />
+          <button
+            onClick={handleJoinRoom}
+            style={{
+              padding: "10px 20px",
+              backgroundColor: "#2563EB",
+              color: "#FFF",
+              border: "none",
+              borderRadius: "6px",
+              fontWeight: "bold",
+              cursor: "pointer",
+            }}
+          >
+            Join
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       style={{
@@ -1127,51 +1257,33 @@ export default function CasinoGame({
               color: "#FBBF24",
             }}
           >
-            🇿🇦 eKasi Casino Game
+            SA eKasi Casino Game
           </h1>
-          <p
-            style={{
-              margin: "4px 0 0",
-              color: "#9CA3AF",
-            }}
-          >
-            Round {currentRound} of {totalRounds} | 40-Card Stripped Deck
+          <p style={{ margin: "4px 0 0", color: "#9CA3AF" }}>
+            Room Code: <strong style={{ color: "#FBBF24" }}>{activeRoomCode}</strong> | Players Connected: {allPlayers.length}
           </p>
         </div>
 
         <div style={{ display: "flex", gap: "8px" }}>
-          <button
-            onClick={() => handleDealGame(1)}
-            style={{
-              padding: "10px 16px",
-              backgroundColor: "#2563EB",
-              color: "#FFF",
-              border: "none",
-              borderRadius: "6px",
-              fontWeight: "bold",
-              cursor: "pointer",
-            }}
-          >
-            👥 Play 2-Player (10 Cards)
-          </button>
+          {localPlayer?.seat_index === 0 && (
+            <button
+              onClick={handleDealGame}
+              style={{
+                padding: "10px 16px",
+                backgroundColor: "#059669",
+                color: "#FFF",
+                border: "none",
+                borderRadius: "6px",
+                fontWeight: "bold",
+                cursor: "pointer",
+              }}
+            >
+              🎴 Deal Match ({allPlayers.length} Players)
+            </button>
+          )}
 
-          <button
-            onClick={() => handleDealGame(2)}
-            style={{
-              padding: "10px 16px",
-              backgroundColor: "#059669",
-              color: "#FFF",
-              border: "none",
-              borderRadius: "6px",
-              fontWeight: "bold",
-              cursor: "pointer",
-            }}
-          >
-            👪 Play 3-Player (13 Cards)
-          </button>
-
-          {opponentCount === 1 &&
-            deck.length > 0 &&
+          {localPlayer?.seat_index === 0 &&
+            (roomData?.deck?.length || 0) > 0 &&
             isHandEmptyCycleReached && (
               <button
                 onClick={handleDealNextRound}
@@ -1202,7 +1314,7 @@ export default function CasinoGame({
           fontSize: "15px",
         }}
       >
-        <strong>System Notice:</strong> {gameLog}
+        <strong>System Notice:</strong> {roomData?.game_log || gameLog}
       </div>
       {/* OPPONENTS & INTERACTIVE OUTFIELD ZONE */}
       <div
@@ -1213,246 +1325,253 @@ export default function CasinoGame({
           marginBottom: "24px",
         }}
       >
-        {aiOpponents.map((ai) => {
-          const metrics = evaluatePile(ai.capturePile);
-          const hasCardsInPile = ai.capturePile.length > 0;
-          const topCard = hasCardsInPile
-            ? ai.capturePile[ai.capturePile.length - 1]
-            : null;
+        {allPlayers
+          .filter((p) => p.id !== localPlayer?.id)
+          .map((opponent) => {
+            const opponentPile: Card[] = opponent.capture_pile || [];
+            const opponentHand: Card[] = opponent.hand || [];
+            const metrics = evaluatePile(opponentPile);
+            const hasCardsInPile = opponentPile.length > 0;
+            const topCard = hasCardsInPile
+              ? opponentPile[opponentPile.length - 1]
+              : null;
 
-          const isPileCardSelected =
-            selectedPileTarget !== null && selectedPileTarget.aiId === ai.id;
+            const isOpponentTurn = roomData?.turn_index === opponent.seat_index;
+            const isPileCardSelected =
+              selectedPileTarget !== null &&
+              selectedPileTarget.aiId === opponent.id;
 
-          const isStealable =
-            selectedHandCard !== null &&
-            topCard !== null &&
-            selectedHandCard.value === topCard.value &&
-            selectedTableCards.length === 0 &&
-            selectedPileTarget === null &&
-            activeTurn === "player";
+            const isStealable =
+              selectedHandCard !== null &&
+              topCard !== null &&
+              selectedHandCard.value === topCard.value &&
+              selectedTableCards.length === 0 &&
+              selectedPileTarget === null &&
+              isMyTurn;
 
-          const floorSum = selectedTableCards.reduce((s, c) => s + c.value, 0);
-          const handVal = selectedHandCard ? selectedHandCard.value : 0;
+            const floorSum = selectedTableCards.reduce((s, c) => s + c.value, 0);
+            const handVal = selectedHandCard ? selectedHandCard.value : 0;
 
-          const canBuildOnto =
-            selectedHandCard !== null &&
-            topCard !== null &&
-            handVal + floorSum === topCard.value &&
-            selectedPileTarget?.aiId === ai.id;
+            const canBuildOnto =
+              selectedHandCard !== null &&
+              topCard !== null &&
+              handVal + floorSum === topCard.value &&
+              selectedPileTarget?.aiId === opponent.id;
 
-          const canBuildUsing =
-            selectedHandCard !== null &&
-            topCard !== null &&
-            selectedTableCards.length === 1 &&
-            // FIX: Access index 0 of the array to get the card value
-            handVal + topCard.value === selectedTableCards[0].value &&
-            selectedPileTarget?.aiId === ai.id;
+            const canBuildUsing =
+              selectedHandCard !== null &&
+              topCard !== null &&
+              selectedTableCards.length === 1 &&
+              handVal + topCard.value === selectedTableCards[0].value &&
+              selectedPileTarget?.aiId === opponent.id;
 
-          return (
-            <div
-              key={ai.id}
-              style={{
-                backgroundColor: "#1F2937",
-                padding: "16px",
-                borderRadius: "8px",
-                border:
-                  activeTurn === `ai${ai.id}`
+            return (
+              <div
+                key={opponent.id}
+                style={{
+                  backgroundColor: "#1F2937",
+                  padding: "16px",
+                  borderRadius: "8px",
+                  border: isOpponentTurn
                     ? "2px solid #FBBF24"
                     : "2px solid transparent",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
                 }}
               >
-                <h3 style={{ margin: 0, fontSize: "18px", color: "#FBBF24" }}>
-                  {ai.name}
-                </h3>
-                <span
+                <div
                   style={{
-                    fontSize: "13px",
-                    backgroundColor: "#374151",
-                    padding: "4px 8px",
-                    borderRadius: "4px",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
                   }}
                 >
-                  🃏 Hand: {ai.hand.length} cards
-                </span>
-              </div>
-
-              <div
-                style={{
-                  display: "flex",
-                  gap: "16px",
-                  marginTop: "12px",
-                  alignItems: "center",
-                }}
-              >
-                <div>
-                  <div
+                  <h3 style={{ margin: 0, fontSize: "18px", color: "#FBBF24" }}>
+                    {opponent.username || `Player (Seat ${opponent.seat_index})`}
+                  </h3>
+                  <span
                     style={{
-                      fontSize: "12px",
-                      color: "#9CA3AF",
-                      marginBottom: "4px",
+                      fontSize: "13px",
+                      backgroundColor: "#374151",
+                      padding: "4px 8px",
+                      borderRadius: "4px",
                     }}
                   >
-                    Pile ({ai.capturePile.length} cards)
-                  </div>
-                  {topCard ? (
+                    🃏 Hand: {opponentHand.length} cards
+                  </span>
+                </div>
+
+                <div
+                  style={{
+                    display: "flex",
+                    gap: "16px",
+                    marginTop: "12px",
+                    alignItems: "center",
+                  }}
+                >
+                  <div>
                     <div
-                      onClick={() => {
-                        if (activeTurn !== "player") return;
-                        if (isPileCardSelected) {
-                          setSelectedPileTarget(null);
-                        } else {
-                          setSelectedPileTarget({ aiId: ai.id, card: topCard });
-                        }
-                      }}
                       style={{
-                        width: "60px",
-                        height: "84px",
-                        backgroundColor: isPileCardSelected
-                          ? "#FEE2E2"
-                          : "#FFF",
-                        color: ["♥", "♦"].includes(topCard.suit)
-                          ? "#DC2626"
-                          : "#000",
-                        borderRadius: "6px",
-                        display: "flex",
-                        flexDirection: "column",
-                        justifyContent: "space-between",
-                        padding: "6px",
-                        boxSizing: "border-box",
-                        fontWeight: "bold",
-                        cursor: activeTurn === "player" ? "pointer" : "default",
-                        border: isPileCardSelected
-                          ? "4px solid #DC2626"
-                          : isStealable
-                            ? "4px dashed #FBBF24"
-                            : "1px solid #CCC",
-                        transform:
-                          isStealable || isPileCardSelected
-                            ? "scale(1.05)"
-                            : "none",
-                        transition: "all 0.2s",
+                        fontSize: "12px",
+                        color: "#9CA3AF",
+                        marginBottom: "4px",
                       }}
                     >
-                      <div style={{ fontSize: "14px", lineHeight: 1 }}>
-                        {topCard.label}
-                      </div>
+                      Pile ({opponentPile.length} cards)
+                    </div>
+                    {topCard ? (
                       <div
+                        onClick={() => {
+                          if (!isMyTurn) return;
+                          if (isPileCardSelected) {
+                            setSelectedPileTarget(null);
+                          } else {
+                            setSelectedPileTarget({
+                              aiId: opponent.id,
+                              card: topCard,
+                            });
+                          }
+                        }}
                         style={{
-                          fontSize: "24px",
-                          textAlign: "center",
-                          lineHeight: 1,
+                          width: "60px",
+                          height: "84px",
+                          backgroundColor: isPileCardSelected
+                            ? "#FEE2E2"
+                            : "#FFF",
+                          color: ["♥", "♦"].includes(topCard.suit)
+                            ? "#DC2626"
+                            : "#000",
+                          borderRadius: "6px",
+                          display: "flex",
+                          flexDirection: "column",
+                          justifyContent: "space-between",
+                          padding: "6px",
+                          boxSizing: "border-box",
+                          fontWeight: "bold",
+                          cursor: isMyTurn ? "pointer" : "default",
+                          border: isPileCardSelected
+                            ? "4px solid #DC2626"
+                            : isStealable
+                              ? "4px dashed #FBBF24"
+                              : "1px solid #CCC",
+                          transform:
+                            isStealable || isPileCardSelected
+                              ? "scale(1.05)"
+                              : "none",
+                          transition: "all 0.2s",
                         }}
                       >
-                        {topCard.suit}
+                        <div style={{ fontSize: "14px", lineHeight: 1 }}>
+                          {topCard.label}
+                        </div>
+                        <div
+                          style={{
+                            fontSize: "24px",
+                            textAlign: "center",
+                            lineHeight: 1,
+                          }}
+                        >
+                          {topCard.suit}
+                        </div>
                       </div>
-                    </div>
-                  ) : (
-                    <div
-                      style={{
-                        width: "60px",
-                        height: "84px",
-                        border: "2px dashed #4B5563",
-                        borderRadius: "6px",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "center",
-                        color: "#4B5563",
-                        fontSize: "12px",
-                      }}
-                    >
-                      Empty
-                    </div>
-                  )}
-                </div>
-
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: "13px", color: "#D1D5DB" }}>
-                    ⚡ Pts: {metrics.points} | Spades: {metrics.spades}
+                    ) : (
+                      <div
+                        style={{
+                          width: "60px",
+                          height: "84px",
+                          border: "2px dashed #4B5563",
+                          borderRadius: "6px",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          color: "#4B5563",
+                          fontSize: "12px",
+                        }}
+                      >
+                        Empty
+                      </div>
+                    )}
                   </div>
-                  {isStealable && (
-                    <button
-                      onClick={() =>
-                        handleExecuteTheft(selectedHandCard!, ai.id)
-                      }
-                      style={{
-                        marginTop: "12px",
-                        width: "100%",
-                        padding: "8px",
-                        backgroundColor: "#DC2626",
-                        color: "#FFF",
-                        border: "none",
-                        borderRadius: "4px",
-                        fontWeight: "bold",
-                        cursor: "pointer",
-                      }}
-                    >
-                      ⚔️ STEAL PILE
-                    </button>
-                  )}
 
-                  {canBuildOnto && (
-                    <button
-                      onClick={() =>
-                        handleBuildOntoPile(
-                          selectedHandCard!,
-                          selectedTableCards,
-                          ai.id,
-                          topCard!,
-                        )
-                      }
-                      style={{
-                        marginTop: "12px",
-                        width: "100%",
-                        padding: "8px",
-                        backgroundColor: "#7C3AED",
-                        color: "#FFF",
-                        border: "none",
-                        borderRadius: "4px",
-                        fontWeight: "bold",
-                        cursor: "pointer",
-                      }}
-                    >
-                      🏗️ BUILD ONTO PILE
-                    </button>
-                  )}
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: "13px", color: "#D1D5DB" }}>
+                      ⚡ Pts: {metrics.points} | Spades: {metrics.spades}
+                    </div>
+                    {isStealable && (
+                      <button
+                        onClick={() =>
+                          handleExecuteTheft(selectedHandCard!, opponent.id)
+                        }
+                        style={{
+                          marginTop: "12px",
+                          width: "100%",
+                          padding: "8px",
+                          backgroundColor: "#DC2626",
+                          color: "#FFF",
+                          border: "none",
+                          borderRadius: "4px",
+                          fontWeight: "bold",
+                          cursor: "pointer",
+                        }}
+                      >
+                        ⚔️ STEAL PILE
+                      </button>
+                    )}
 
-                  {canBuildUsing && (
-                    <button
-                      onClick={() =>
-                        handleBuildUsingPile(
-                          selectedHandCard!,
-                          selectedTableCards,
-                          ai.id,
-                          topCard!,
-                        )
-                      }
-                      style={{
-                        marginTop: "12px",
-                        width: "100%",
-                        padding: "8px",
-                        backgroundColor: "#2563EB",
-                        color: "#FFF",
-                        border: "none",
-                        borderRadius: "4px",
-                        fontWeight: "bold",
-                        cursor: "pointer",
-                      }}
-                    >
-                      🧮 BUILD USING PILE
-                    </button>
-                  )}
+                    {canBuildOnto && (
+                      <button
+                        onClick={() =>
+                          handleBuildOntoPile(
+                            selectedHandCard!,
+                            selectedTableCards,
+                            opponent.id,
+                            topCard!,
+                          )
+                        }
+                        style={{
+                          marginTop: "12px",
+                          width: "100%",
+                          padding: "8px",
+                          backgroundColor: "#7C3AED",
+                          color: "#FFF",
+                          border: "none",
+                          borderRadius: "4px",
+                          fontWeight: "bold",
+                          cursor: "pointer",
+                        }}
+                      >
+                        🏗️ BUILD ONTO PILE
+                      </button>
+                    )}
+
+                    {canBuildUsing && (
+                      <button
+                        onClick={() =>
+                          handleBuildUsingPile(
+                            selectedHandCard!,
+                            selectedTableCards,
+                            opponent.id,
+                            topCard!,
+                          )
+                        }
+                        style={{
+                          marginTop: "12px",
+                          width: "100%",
+                          padding: "8px",
+                          backgroundColor: "#2563EB",
+                          color: "#FFF",
+                          border: "none",
+                          borderRadius: "4px",
+                          fontWeight: "bold",
+                          cursor: "pointer",
+                        }}
+                      >
+                        🧮 BUILD USING PILE
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
-          );
-        })}
+            );
+          })}
       </div>
 
       {/* THE TABLE FLOOR FIELD */}
@@ -1497,7 +1616,7 @@ export default function CasinoGame({
                 <div
                   key={card.id}
                   onClick={() =>
-                    activeTurn === "player" && toggleTableSelection(card, "id")
+                    isMyTurn && toggleTableSelection(card, "id")
                   }
                   style={{
                     width: "70px",
@@ -1511,7 +1630,7 @@ export default function CasinoGame({
                     padding: "8px",
                     boxSizing: "border-box",
                     fontWeight: "bold",
-                    cursor: activeTurn === "player" ? "pointer" : "default",
+                    cursor: isMyTurn ? "pointer" : "default",
                     border: isSelected ? "4px solid #D97706" : "1px solid #CCC",
                     transform: isSelected ? "translateY(-6px)" : "none",
                     boxShadow: "0 4px 6px rgba(0,0,0,0.3)",
@@ -1543,7 +1662,7 @@ export default function CasinoGame({
           padding: "20px",
           borderRadius: "12px",
           border:
-            activeTurn === "player" ? "2px solid #3B82F6" : "1px solid #374151",
+            isMyTurn ? "2px solid #3B82F6" : "1px solid #374151",
         }}
       >
         <div
@@ -1581,14 +1700,14 @@ export default function CasinoGame({
                   color: "#9CA3AF",
                 }}
               >
-                Your Stack: {playerCapturePile.length} cards | Spades:{" "}
-                {playerCapturePile.filter((c) => c.suit === "♠").length}
+                Your Stack: {(localPlayer?.capture_pile || []).length} cards | Spades:{" "}
+                {(localPlayer?.capture_pile || []).filter((c) => c.suit === "♠").length}
               </p>
             )}
           </div>
 
           {/* COMBINATIONS AND ACTION HOT-BAR */}
-          {selectedHandCard && activeTurn === "player" && (
+          {selectedHandCard && isMyTurn && (
             <div
               style={{
                 display: "flex",
@@ -1744,7 +1863,7 @@ export default function CasinoGame({
               <div
                 key={card.id}
                 onClick={() =>
-                  activeTurn === "player" &&
+                  isMyTurn &&
                   setSelectedHandCard(isSelected ? null : card)
                 }
                 style={{
@@ -1759,7 +1878,7 @@ export default function CasinoGame({
                   padding: "10px",
                   boxSizing: "border-box",
                   fontWeight: "bold",
-                  cursor: activeTurn === "player" ? "pointer" : "default",
+                  cursor: isMyTurn ? "pointer" : "default",
                   border: isSelected ? "4px solid #3B82F6" : "1px solid #CCC",
                   transform: isSelected ? "translateY(-10px)" : "none",
                   boxShadow: isSelected
